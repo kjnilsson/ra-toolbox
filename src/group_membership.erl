@@ -9,6 +9,7 @@
          %% Client api
          join_group/3,
          leave_group/3,
+         query/2,
 
          %% Cluster management API
          start/2
@@ -17,21 +18,15 @@
 -define(STATE, ?MODULE).
 
 -type timestamp() :: integer().
-
 -type status() :: up | {disconnected, When :: timestamp()}.
-
 -type group() :: #{pid() => status()}.
 
--record(?STATE, {groups :: #{term() => group()}}).
+-record(?STATE, {groups = #{} :: #{term() => group()}}).
 
 -opaque state() :: #?STATE{}.
+-export_type([state/0]).
 
--export_type([
-              state/0
-              ]).
-
-
-init(_Config) -> #{}.
+init(_Config) -> #?STATE{}.
 
 apply(_Meta, {join, GroupKey, Pid}, #?STATE{groups = Groups0} = State) ->
     Groups = maps:update_with(GroupKey,
@@ -50,9 +45,11 @@ apply(_Meta, {leave, GroupKey, Pid}, #?STATE{groups = Groups0} = State) ->
     end;
 apply(#{system_time := Ts}, {down, Pid, noconnection},
       #?STATE{groups = Groups0} = State) ->
-    %% What does `noconnection` mean for a specific application
-    %% Assuming the node may come back
-    %% 1. Mark the Pid as disconnected and record the timestamp
+    %% This implementation assumes that erlang nodes will at come back at
+    %% some point and thus processes on disconnected nodes may still be
+    %% up.
+
+    %% Mark the pid as disconnected and record the timestamp
 
     %% Update the pid in all groups
     Groups = maps:map(fun(_, Group) when is_map_key(Pid, Group) ->
@@ -60,7 +57,7 @@ apply(#{system_time := Ts}, {down, Pid, noconnection},
                          (_, Group) ->
                               Group
                       end, Groups0),
-    %% 2. monitor the node the pid is on
+    %% Monitor the node the pid is on (see {nodeup, Node} below)
     Effect = {monitor, node, node(Pid)},
     {State#?STATE{groups = Groups}, ok, Effect};
 apply(_Meta, {down, Pid, _},
@@ -73,10 +70,12 @@ apply(_Meta, {down, Pid, _},
     {State#?STATE{groups = Groups}, ok};
 apply(_Meta, {nodeup, Node},
       #?STATE{groups = Groups0} = State) ->
-    %% 3. re-request the monitor for the pid when the node comes back
+    %% Now we need to work out if any pids that were disconnected are still
+    %% alive.
+    %% Re-request the monitor for the pids on this node
     Effects = [{monitor, process, Pid} || Pid <- disconnected_pids(Groups0),
                                           node(Pid) == Node],
-    %% update the status of these pids to 'up' as we will discover if they
+    %% Update the status of these pids to 'up' as we will discover if they
     %% disappeared during the disconnection
     Groups = maps:map(fun(_, Group) ->
                               maps:map(fun (Pid, _) when node(Pid) == Node ->
@@ -92,11 +91,12 @@ apply(_Meta, {nodedown, _Node}, State) ->
 state_enter(leader, #?STATE{groups = Groups}) ->
     %% re-request monitors for all known pids
     Pids = maps:fold(fun(_, Group, Acc) ->
-                               maps:fold(fun (Pid, _) ->
-                                                Acc#{Pid => ''}
-                                        end, Acc, Group)
-                       end, #{}, Groups),
-    [{monitor, process, Pid} || Pid <- maps:values(Pids)];
+                             maps:fold(fun (Pid, _, A) ->
+                                               A#{Pid => ''}
+                                       end, Acc, Group)
+                     end, #{}, Groups),
+    io:format("state_enter: leader ~w", [Pids]),
+    [{monitor, process, Pid} || Pid <- maps:keys(Pids)];
 state_enter(_, _) ->
     [].
 
@@ -106,13 +106,13 @@ state_enter(_, _) ->
 %% returns a unique list of disconnected Pids
 disconnected_pids(Groups) ->
     Pids = maps:fold(fun(_, Group, Acc) ->
-                               maps:fold(fun (Pid, {disconnected, _}) ->
-                                                Acc#{Pid => ''};
-                                            (_, _) ->
-                                                Acc
+                               maps:fold(fun (Pid, {disconnected, _}, A) ->
+                                                A#{Pid => ''};
+                                            (_, _, A) ->
+                                                A
                                         end, Acc, Group)
                        end, #{}, Groups),
-    maps:to_list(Pids).
+    maps:keys(Pids).
 
 %% Client API
 
@@ -122,10 +122,21 @@ join_group(ServerId, GroupKey, Pid) ->
 leave_group(ServerId, GroupKey, Pid) ->
     ra:process_command(ServerId, {leave, GroupKey, Pid}).
 
+query(ServerId, GroupKey) ->
+    ra:leader_query(ServerId,
+                    fun (#?STATE{groups = Groups}) ->
+                            case Groups of
+                                #{GroupKey := Members} ->
+                                    maps:keys(Members);
+                                _ ->
+                                    []
+                            end
+                    end).
 
 %% Cluster API
 
 start(Name, Nodes) when is_atom(Name) ->
+    application:ensure_all_started(ra),
     ServerIds = [{Name, N} || N <- Nodes],
     MachineConf = {module, ?MODULE, #{}},
     ra:start_cluster(Name, MachineConf, ServerIds).
