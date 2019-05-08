@@ -1,6 +1,10 @@
 -module(group_membership).
 -behaviour(ra_machine).
 
+%% simple group membership machine that automatically removes crashed processes
+%% from the any groups but assumes that nodes eventually _will_ come back.
+%% (no timeouts)
+
 -export([
          init/1,
          apply/3,
@@ -15,103 +19,71 @@
          start/2
          ]).
 
--define(STATE, ?MODULE).
+% -type key() :: term().
+% -type group() :: #{pid() => ok}.
+% -type state() :: #{key() => group()}.
 
--type timestamp() :: integer().
--type status() :: up | {disconnected, When :: timestamp()}.
--type group() :: #{pid() => status()}.
+init(_Config) -> #{}.
 
--record(?STATE, {groups = #{} :: #{term() => group()}}).
-
--opaque state() :: #?STATE{}.
--export_type([state/0]).
-
-init(_Config) -> #?STATE{}.
-
-apply(_Meta, {join, GroupKey, Pid}, #?STATE{groups = Groups0} = State) ->
-    Groups = maps:update_with(GroupKey,
-                             fun(Group) -> Group#{Pid => up}  end,
-                             #{Pid => up}, Groups0),
+apply(_Meta, {join, GroupKey, Pid}, State0) ->
+    State = maps:update_with(GroupKey,
+                             fun(Group) -> Group#{Pid => ok}  end,
+                             #{Pid => ok}, State0),
+    %% we want to know if the process crashes so ask the Ra leader to monitor
+    %% the process on our behalf and commit a {down, Pid, Info} entry to the log
+    %% if a 'DOWN' is received
     Effect = {monitor, process, Pid},
-    {State#?STATE{groups = Groups}, ok, Effect};
-apply(_Meta, {leave, GroupKey, Pid}, #?STATE{groups = Groups0} = State) ->
-    case maps:take(GroupKey, Groups0) of
+    {State, ok, Effect};
+apply(_Meta, {leave, GroupKey, Pid}, State0) ->
+    case maps:take(GroupKey, State0) of
         error ->
-            {State, ok};
-        {Group0, Groups} ->
+            {State0, ok};
+        {Group0, State} ->
             Group = maps:remove(Pid, Group0),
-            Effect = {demonitor, process, Pid},
-            {State#?STATE{groups = Groups#{GroupKey => Group}}, ok, Effect}
+            %% TODO: check if the pid is in any other group
+            %% if not then demonitor
+            %% Effect = {demonitor, process, Pid},
+            {State#{GroupKey => Group}, ok}
     end;
-apply(#{system_time := Ts}, {down, Pid, noconnection},
-      #?STATE{groups = Groups0} = State) ->
+apply(_Meta, {down, Pid, noconnection}, State) ->
     %% This implementation assumes that erlang nodes will at come back at
     %% some point and thus processes on disconnected nodes may still be
-    %% up.
-
-    %% Mark the pid as disconnected and record the timestamp
-
-    %% Update the pid in all groups
-    Groups = maps:map(fun(_, Group) when is_map_key(Pid, Group) ->
-                              Group#{Pid => {disconnected, Ts}};
-                         (_, Group) ->
-                              Group
-                      end, Groups0),
     %% Monitor the node the pid is on (see {nodeup, Node} below)
+    %% so that we can detect when the node is re-connected and discover the
+    %% actual fate of the process
     Effect = {monitor, node, node(Pid)},
-    {State#?STATE{groups = Groups}, ok, Effect};
-apply(_Meta, {down, Pid, _},
-      #?STATE{groups = Groups0} = State) ->
+    {State, ok, Effect};
+apply(_Meta, {down, Pid, _Info}, State0) ->
     %% Any other down reason is either 'noproc' or an exit reason term so we can
     %% just remove the pid from any groups it belongs to
-    Groups = maps:map(fun(_, Group) ->
-                              maps:remove(Pid, Group)
-                      end, Groups0),
-    {State#?STATE{groups = Groups}, ok};
-apply(_Meta, {nodeup, Node},
-      #?STATE{groups = Groups0} = State) ->
+    State = maps:map(fun(_, Group) ->
+                             maps:remove(Pid, Group)
+                     end, State0),
+    {State, ok};
+apply(_Meta, {nodeup, Node}, State) ->
     %% Now we need to work out if any pids that were disconnected are still
     %% alive.
     %% Re-request the monitor for the pids on this node
-    Effects = [{monitor, process, Pid} || Pid <- disconnected_pids(Groups0),
+    Effects = [{monitor, process, Pid} || Pid <- all_pids(State),
                                           node(Pid) == Node],
-    %% Update the status of these pids to 'up' as we will discover if they
-    %% disappeared during the disconnection
-    Groups = maps:map(fun(_, Group) ->
-                              maps:map(fun (Pid, _) when node(Pid) == Node ->
-                                               up;
-                                           (_, Status) ->
-                                               Status
-                                       end, Group)
-                      end, Groups0),
-    {State#?STATE{groups = Groups}, ok, Effects};
+    {State, ok, Effects};
 apply(_Meta, {nodedown, _Node}, State) ->
     {State, ok}.
 
-state_enter(leader, #?STATE{groups = Groups}) ->
+state_enter(leader, State) ->
     %% re-request monitors for all known pids
-    Pids = maps:fold(fun(_, Group, Acc) ->
-                             maps:fold(fun (Pid, _, A) ->
-                                               A#{Pid => ''}
-                                       end, Acc, Group)
-                     end, #{}, Groups),
-    io:format("state_enter: leader ~w", [Pids]),
-    [{monitor, process, Pid} || Pid <- maps:keys(Pids)];
+    [{monitor, process, Pid} || Pid <- all_pids(State)];
 state_enter(_, _) ->
     [].
 
 
 %% local functions
 
-%% returns a unique list of disconnected Pids
-disconnected_pids(Groups) ->
+%% returns a unique list of known Pids
+all_pids(Groups) ->
     Pids = maps:fold(fun(_, Group, Acc) ->
-                               maps:fold(fun (Pid, {disconnected, _}, A) ->
-                                                A#{Pid => ''};
-                                            (_, _, A) ->
-                                                A
-                                        end, Acc, Group)
-                       end, #{}, Groups),
+                               maps:merge(Group, Acc)
+                     end, #{}, Groups),
     maps:keys(Pids).
 
 %% Client API
@@ -124,7 +96,7 @@ leave_group(ServerId, GroupKey, Pid) ->
 
 query(ServerId, GroupKey) ->
     ra:leader_query(ServerId,
-                    fun (#?STATE{groups = Groups}) ->
+                    fun (Groups) ->
                             case Groups of
                                 #{GroupKey := Members} ->
                                     maps:keys(Members);

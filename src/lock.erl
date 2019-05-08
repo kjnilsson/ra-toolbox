@@ -20,23 +20,21 @@
          start/2
         ]).
 
--record(lock, {holder :: undefined | pid(),
-               waiting = queue:new() :: queue:queue({pid(), up | disconnected})
-              }).
-
--type state() :: #{term() => #lock{}}.
-
--spec init(_) -> state().
-init(_Config) -> #{}.
-
 -type effect() :: {monitor, process, pid()} | [effect()].
 -type meta() :: #{}.
 -type cmd() :: {acquire | release, Key :: term(), pid()} |
                {down, pid(), Info :: term()}.
 
+-record(lock, {holder :: undefined | pid(),
+               waiting = [] :: [pid()]}).
+-type state() :: #{term() => #lock{}}.
+
+-spec init(_) -> state().
+init(_Config) -> #{}.
+
 -spec apply(meta(), cmd(), state()) ->
-    {state(), ok | not_acquired | {acquired, non_neg_integer()}} |
-    {state(), ok | not_acquired | {acquired, non_neg_integer()}, effect()}.
+    {state(), ok | queued | {acquired, non_neg_integer()}} |
+    {state(), ok | queued | {acquired, non_neg_integer()}, effect()}.
 apply(#{index := Idx}, {acquire, Key, Pid}, State) ->
     %% if noone holds the lock for this key, grant it and
     %% return {acquired, Idx} where the raft index can be used as a
@@ -52,8 +50,11 @@ apply(#{index := Idx}, {release, Key, Pid}, State0) ->
 apply(#{index := Idx}, {down, Pid, _Info}, State) ->
     %% if this pid holds any lock it releases them
     %% also removes this pid from the waiting queues
-    %% NB: no specifici down reason handling
+    %% NB: no specific down reason handling
     handle_pid_down(Pid, Idx, State).
+
+%% TODO: notify on leader change
+
 
 %% local
 
@@ -64,9 +65,9 @@ handle_aquire(Key, Pid, Idx, State) ->
                        waiting = Waiting} = Lock0}
           when is_pid(Holder) ->
             %% lock is held, queue the Pid
-            Lock = Lock0#lock{waiting = queue:in({Pid, up}, Waiting)},
+            Lock = Lock0#lock{waiting = Waiting ++ [Pid]},
             %% monitor the pid
-            {maps:put(Key, Lock, State), not_acquired, Effect};
+            {maps:put(Key, Lock, State), queued, Effect};
         #{Key := #lock{holder = undefined,
                        waiting = []} = Lock0} ->
             Lock = Lock0#lock{holder = Pid},
@@ -85,7 +86,7 @@ handle_pid_down(Pid, Idx, State0) ->
                       {S, ok, [Eff | Effs]};
                   (Key, #lock{waiting = W0} = L, {S0, ok, Effs}) ->
                   %% lock is not held just clean the waiting list here
-                  W = [W || {P, _} = W <- W0, P =/= Pid],
+                  W = [W || W <- W0, W =/= Pid],
                   {S0#{Key => L#lock{waiting = W}}, ok, Effs}
               end, {State0, ok, []}, State0).
 
@@ -101,29 +102,23 @@ release_lock(Key, Pid, Idx, State0) ->
                        waiting = Waiting0} = Lock0} ->
             %% If there are waiting processes dequeue the next up process
             %% and grant the lock to it
-            case next_up(Waiting0, []) of
-                {{NextPid, up}, Waiting} ->
+            case Waiting0 of
+                [NextPid | Waiting] ->
                     %% no need to keep the lock key
                     Lock = Lock0#lock{waiting = Waiting},
                     Effects = [{send_msg, NextPid, {acquired, Key, Idx}}
                                | Effect],
                     %% monitor the pid
                     {maps:put(Key, Lock, State0), ok, Effects};
-                {undefined, Waiting} ->
+                [] ->
                     %% no suitable process available
                     Lock = Lock0#lock{holder = undefined,
-                                      waiting = Waiting},
+                                      waiting = []},
                     {maps:put(Key, Lock, State0), ok, Effect}
             end;
         _ ->
             {State0, ok}
     end.
-
-next_up([{_, up} = Next | Rem], Disconnected) ->
-    {Next, Disconnected ++ Rem};
-next_up([], Disconnected) ->
-    {undefined, Disconnected}.
-
 
 %% Client api
 

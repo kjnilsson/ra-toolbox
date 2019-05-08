@@ -15,33 +15,34 @@
          start/2
         ]).
 
+%% ra_machine implementation
 
 init(_Config) -> #{}.
 
 apply(_Meta, {put, Key, Value}, State) ->
-    {maps:put(Key, Value, State), inserted};
-apply(_Meta, {delete, Key}, State0) ->
-    State = maps:remove(Key, State0),
-    {State, ok};
-apply(_Meta, {get, Key}, State) ->
-    Result = maps:get(Key, State, key_not_found),
-    {State, Result}.
-
+    {maps:put(Key, Value, State), ok};
+apply(_Meta, {delete, Key}, State) ->
+    {maps:remove(Key, State), ok}.
 
 %% Client api
 
 put(ServerId, Key, Value) ->
-    ra:process_command(ServerId, {put, Key, Value}).
+    {ok, Result, _Leader} = ra:process_command(ServerId, {put, Key, Value}),
+    Result.
 
 delete(ServerId, Key) ->
-    ra:process_command(ServerId, {delete, Key}).
+    {ok, Result, _Leader} = ra:process_command(ServerId, {delete, Key}),
+    Result.
 
 get(ServerId, Key) ->
-    {ok, Res, _} = ra:consistent_query(ServerId,
-                                       fun(State) ->
-                                               maps:get(Key, State, key_not_found)
-                                       end),
-    Res.
+    QueryFun = fun(State)
+                     when is_map_key(Key, State) ->
+                       {ok, maps:get(Key, State)};
+                  (_State) ->
+                       {error, key_not_found}
+               end,
+    {ok, Result, _} = ra:consistent_query(ServerId, QueryFun),
+    Result.
 
 %% Cluster api
 
