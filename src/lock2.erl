@@ -4,8 +4,8 @@
 %% @doc
 %% Lock machine implementation that starts a timer if a current lock holder
 %% goes down with a `noconnection'.
-%% The timer is set to 75s which should give the client process enough time to
-%% detect the disconnection. (net_ticktime + 15s).
+%% The timer is set to 75s which should (!) give the client process
+%% enough time to detect the disconnection. (net_ticktime + 15s).
 %% When the client notices the broken connection it immediately enters a
 %% re-acquire loop, i.e. it assumes the lock may have been released.
 %% If the connection is re-established within the grace period
