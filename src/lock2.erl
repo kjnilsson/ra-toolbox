@@ -5,7 +5,7 @@
 %% Lock machine implementation that starts a timer if a current lock holder
 %% goes down with a `noconnection'.
 %% The timer is set to 75s which should (!) give the client process
-%% enough time to detect the disconnection. (net_ticktime + 15s).
+%% enough (if we're lucky!) time to detect the disconnection. (net_ticktime + 15s).
 %% When the client notices the broken connection it immediately enters a
 %% re-acquire loop, i.e. it assumes the lock may have been released.
 %% If the connection is re-established within the grace period
@@ -34,7 +34,7 @@
 
 -record(lock, {holder :: undefined | pid(),
                disconnected :: undefined | system_time(),
-               waiting = queue:new() :: queue:queue({pid(), up | disconnected})
+               waiting = [] :: [{pid(), up | disconnected}]
               }).
 
 -type state() :: #{term() => #lock{}}.
@@ -48,36 +48,39 @@ init(_Config) -> #{}.
                {down, pid(), Info :: term()}.
 
 -spec apply(meta(), cmd(), state()) ->
-    {state(), ok | not_acquired | {acquired, non_neg_integer()}} |
-    {state(), ok | not_acquired | {acquired, non_neg_integer()}, effect()}.
-apply(#{index := Idx}, {acquire, Key, Pid}, State) ->
+    {state(), ok | not_acquired | acquired} |
+    {state(), ok | not_acquired | acquired, effect()}.
+apply(_Meta, {acquire, Key, Pid}, State) ->
     %% if noone holds the lock for this key, grant it and
     %% return {acquired, Idx} where the raft index can be used as a
     %% "fencing token" - else queue the pid and return `not_acquired`.
     %% If the lock later is acquired by the Pid it will send a message of the
     %% form `{acquired, Key, Idx}` to the Pid
     %% The Pid will also be monitored
-    handle_aquire(Key, Pid, Idx, State);
-apply(#{index := Idx}, {release, Key, Pid}, State0) ->
+    handle_aquire(Key, Pid, State);
+apply(_Meta, {release, Key, Pid}, State0) ->
     %% releases the lock (if held) and grants the lock to the next waiting
     %% Pid
-    release_lock(Key, Pid, Idx, State0);
+    release_lock(Key, Pid, State0, []);
 apply(#{system_time := Ts}, {down, Pid, noconnection}, State) ->
+    error_logger:info_msg("got noconnection for ~w", [Pid]),
     %% enter a grace period where the keys held by the pid will not be
     %% acquired by any other process
     %% At this poing we could monitor the node for the pid and if it comes
     %% back re-issue the process monitor to discover if the process has crashed
     %% But for now we just wait for the process to re-acquire the lock
     handle_down_noconnection(Ts, Pid, State);
-apply(#{index := Idx}, {down, Pid, _Info}, State) ->
+apply(_Meta, {down, Pid, _Info}, State) ->
+    error_logger:info_msg("got down  ~w for ~w", [_Info, Pid]),
     %% if this pid holds any lock it releases them
     %% also removes this pid from the waiting queues
-    handle_pid_down(Pid, Idx, State);
-apply(#{index := Idx}, {timeout, Key}, State) ->
+    handle_pid_down(Pid, State);
+apply(_Meta, {timeout, Key}, State) ->
+    error_logger:info_msg("got timeout for ~w", [Key]),
     %% a key's grace period timedout
     case State of
         #{Key := #lock{holder = Pid}} ->
-            release_lock(Key, Pid, Idx, State);
+            release_lock(Key, Pid, State, []);
         _ ->
             {State, ok}
     end.
@@ -109,18 +112,22 @@ state_enter(_, _) ->
 %% local
 
 handle_down_noconnection(Ts, Pid, State0) ->
-    maps:fold(fun (Key, #lock{holder = H} = L, {Effs, S0} = Acc) ->
+    maps:fold(fun (Key, #lock{holder = H} = L, {S0, _, Effs} = Acc) ->
                       case H of
                           _ when H == Pid ->
-                              Eff = {timer, Key, 75000},
-                              {[Eff | Effs],
-                               S0#{Key => L#lock{disconnected = Ts}}};
+                              %% TODO make timeout configurable - it should be
+                              %% scaled according to net_ticktime.
+                              %% Tests use a net_ticktime of 10s
+                              Eff = {timer, Key, 15000},
+                              error_logger:info_msg("setting timer for ~w", [Key]),
+                              {S0#{Key => L#lock{disconnected = Ts}}, ok,
+                               [Eff | Effs]};
                           _ ->
                               Acc
                       end
-              end, {[], State0}, State0).
+              end, {State0, ok, []}, State0).
 
-handle_aquire(Key, Pid, Idx, State) ->
+handle_aquire(Key, Pid, State) ->
     Effect = {monitor, process, Pid},
     case State of
         #{Key := #lock{holder = Pid} = Lock0} ->
@@ -129,44 +136,43 @@ handle_aquire(Key, Pid, Idx, State) ->
             Lock = Lock0#lock{disconnected = undefined},
             %% cancel timer
             TEff = {timer, Key, infinity},
-            {maps:put(Key, Lock, State), {acquired, Idx}, [Effect, TEff]};
+            {maps:put(Key, Lock, State), acquired, [Effect, TEff]};
         #{Key := #lock{holder = Holder,
                        waiting = Waiting} = Lock0}
           when is_pid(Holder) ->
             %% lock is held, queue the Pid
-            Lock = Lock0#lock{waiting = queue:in({Pid, up}, Waiting)},
+            Lock = Lock0#lock{waiting = [{Pid, up} | Waiting]},
             %% monitor the pid
-            {maps:put(Key, Lock, State), not_acquired, Effect};
+            {maps:put(Key, Lock, State), queued, Effect};
         #{Key := #lock{holder = undefined,
                        waiting = []} = Lock0} ->
             Lock = Lock0#lock{holder = Pid},
             %% use the raft index as the fencing token
-            {maps:put(Key, Lock, State), {acquired, Idx}, Effect};
+            {maps:put(Key, Lock, State), acquired, Effect};
          _ ->
             Lock = #lock{holder = Pid},
-            {maps:put(Key, Lock, State), {acquired, Idx}, Effect}
+            {maps:put(Key, Lock, State), acquired, Effect}
     end.
 
 
-handle_pid_down(Pid, Idx, State0) ->
+handle_pid_down(Pid, State0) ->
     maps:fold(fun (Key, #lock{holder = H}, {S0, ok, Effs})
                     when Pid == H ->
-                      {S, ok, Eff} = release_lock(Key, Pid, Idx, S0),
-                      {S, ok, [Eff | Effs]};
+                      release_lock(Key, Pid, S0, Effs);
                   (Key, #lock{waiting = W0} = L, {S0, ok, Effs}) ->
                   %% lock is not held just clean the waiting list here
                   W = [W || {P, _} = W <- W0, P =/= Pid],
                   {S0#{Key => L#lock{waiting = W}}, ok, Effs}
               end, {State0, ok, []}, State0).
 
-release_lock(Key, Pid, Idx, State0) ->
+release_lock(Key, Pid, State0, Effects0) ->
     Effect = {demonitor, process, Pid},
     case State0 of
         #{Key := #lock{holder = Pid,
                        waiting = []}} ->
             %% the lock is held by the pid and noone is waiting.
             %% delete the lock key
-            {maps:remove(Key, State0), ok, Effect};
+            {maps:remove(Key, State0), ok, [Effect, Effects0]};
         #{Key := #lock{holder = Pid,
                        waiting = Waiting0} = Lock0} ->
             %% If there are waiting processes dequeue the next up process
@@ -175,18 +181,18 @@ release_lock(Key, Pid, Idx, State0) ->
                 {{NextPid, up}, Waiting} ->
                     %% no need to keep the lock key
                     Lock = Lock0#lock{waiting = Waiting},
-                    Effects = [{send_msg, NextPid, {acquired, Key, Idx}}
-                               | Effect],
+                    Effects = [{send_msg, NextPid, {acquired, Key}},
+                               Effect | Effects0],
                     %% monitor the pid
                     {maps:put(Key, Lock, State0), ok, Effects};
                 {undefined, Waiting} ->
                     %% no suitable process available
                     Lock = Lock0#lock{holder = undefined,
                                       waiting = Waiting},
-                    {maps:put(Key, Lock, State0), ok, Effect}
+                    {maps:put(Key, Lock, State0), ok, [Effect | Effects0]}
             end;
         _ ->
-            {State0, ok}
+            {State0, ok, Effects0}
     end.
 
 next_up([{_, up} = Next | Rem], Disconnected) ->
