@@ -1,4 +1,4 @@
--module(lock2_SUITE).
+-module(session_lock_SUITE).
 
 -compile(export_all).
 
@@ -59,7 +59,7 @@ end_per_group(_Group, _Config) ->
     ok.
 
 init_per_testcase(TestCase, Config) ->
-    {ok, Servers, []} = lock2:start(TestCase, ?config(nodes, Config)),
+    {ok, Servers, []} = session_lock:start(TestCase, ?config(nodes, Config)),
     [{servers, Servers} | Config].
 
 end_per_testcase(TestCase, Config) ->
@@ -75,10 +75,10 @@ acquire_release(Config) ->
     Lock = ?FUNCTION_NAME,
     [N | _] = ?config(servers, Config),
     %% span
-    {ok, acquired, Leader} = lock2:acquire(N, Lock),
-    {ok, acquired, Leader} = lock2:acquire(N, Lock),
-    {ok, ok, Leader} = lock2:release(N, Lock),
-    {ok, acquired, Leader} = lock2:acquire(N, Lock),
+    {ok, acquired, Leader} = session_lock:acquire(N, Lock),
+    {ok, acquired, Leader} = session_lock:acquire(N, Lock),
+    {ok, ok, Leader} = session_lock:release(N, Lock),
+    {ok, acquired, Leader} = session_lock:acquire(N, Lock),
     ok.
 
 async_acquire(Config) ->
@@ -88,18 +88,18 @@ async_acquire(Config) ->
     Self = self(),
     %% spawn lock holder
     Pid = spawn(W, fun () ->
-                           {ok, acquired, _} = lock2:acquire(N, Lock),
+                           {ok, acquired, _} = session_lock:acquire(N, Lock),
                            Self ! try_acquire,
                            receive
                                release_please ->
-                                   {ok, _, _} = lock2:release(N, Lock)
+                                   {ok, _, _} = session_lock:release(N, Lock)
                            end
                    end),
     receive
         try_acquire -> ok
     after 2000 -> exit(try_acquire_timeout)
     end,
-    {ok, queued, _} = lock2:acquire(N, Lock),
+    {ok, queued, _} = session_lock:acquire(N, Lock),
     Pid ! release_please,
     receive
         {acquired, Lock} ->
@@ -116,11 +116,11 @@ async_acquire_disconnect(Config) ->
     Self = self(),
     %% spawn lock holder
     _ = spawn(W, fun () ->
-                         {ok, acquired, _} = lock2:acquire(N, Lock),
+                         {ok, acquired, _} = session_lock:acquire(N, Lock),
                          Self ! try_acquire,
                          receive
                              release_please ->
-                                 {ok, _, _} = lock2:release(N, Lock)
+                                 {ok, _, _} = session_lock:release(N, Lock)
                          end
                  end),
     receive
@@ -129,7 +129,7 @@ async_acquire_disconnect(Config) ->
     end,
     W2 = spawn(?config(worker2, Config),
                fun () ->
-                       {ok, queued, {_, LeaderNode}} = lock2:acquire(N, Lock),
+                       {ok, queued, {_, LeaderNode}} = session_lock:acquire(N, Lock),
                        Self ! {w2_queued, LeaderNode},
                        receive
                            {acquired, Lock} ->

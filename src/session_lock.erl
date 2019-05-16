@@ -1,4 +1,4 @@
--module(lock2).
+-module(session_lock).
 -behaviour(ra_machine).
 
 %% @doc
