@@ -68,6 +68,8 @@ apply(_Meta, {nodeup, Node}, State) ->
                                           node(Pid) == Node],
     {State, ok, Effects};
 apply(_Meta, {nodedown, _Node}, State) ->
+    %% group member failures accounted for above, we must handle
+    %% this message but do nothing by design
     {State, ok}.
 
 state_enter(leader, State) ->
